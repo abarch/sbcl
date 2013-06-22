@@ -1581,10 +1581,24 @@
 
          ;; Pack any leftover normal TNs. This is to deal with :MORE TNs,
          ;; which could possibly not appear in any local TN map.
-         (do ((tn (ir2-component-normal-tns 2comp) (tn-next tn)))
-             ((null tn))
-           (unless (tn-offset tn)
-             (pack-tn tn nil optimize)))
+         (collect ((tns-parents))
+           (do ((tn (ir2-component-normal-tns 2comp) (tn-next tn)))
+               ((null tn))
+             (if (sc-is tn catch-block)
+                 (let ((refs  (gen-refs tn)))
+                   (if refs
+                     (let* ((parent (find-common-parent (gen-refs tn)))
+                            (tn-parent (cons tn parent)))
+                       (tns-parents tn-parent))
+                     (unless (tn-offset tn)
+                       (pack-tn tn nil optimize))))
+                 (unless (tn-offset tn)
+                   (pack-tn tn nil optimize))))
+           (let ((sorted-tns (sort-according-to-live-range
+                              (tns-parents))))
+             (dolist (tn  sorted-tns)
+                 (unless (tn-offset tn)
+                   (pack-tn tn nil optimize)))))
 
          ;; Do load TN packing and emit saves.
          (let ((*repack-blocks* nil))
@@ -1606,3 +1620,64 @@
 
          (values))
     (clean-up-pack-structures)))
+
+
+
+(defun gen-lexenv (ref)
+  (let* ((vop (tn-ref-vop ref))
+         (node (vop-node vop))
+         (lexenv (node-lexenv node)))
+    (values (lexenv-lambda lexenv))))
+
+
+(defun gen-refs (tn)
+  (when (sc-is tn catch-block)
+    (collect ((refs))
+    (labels ((iter-ref (head)
+               (do ((ref head (tn-ref-next ref)))
+                 ((null ref))
+                 (refs ref))))
+      (iter-ref (tn-reads tn))
+      (iter-ref (tn-writes tn)))
+     (refs))))
+
+
+
+(defun all-parents (clambda)
+  (collect ((parents))
+    (do ((par  clambda (lambda-parent par)))
+           ((null par))
+          (parents par))
+    (parents)))
+
+
+;; for a and b :clambda
+(defun parent-p (a b)
+(unless (eq a b)
+  (find a (all-parents b))))
+
+
+(defun find-common-parent (tn-refs)
+  (destructuring-bind (a &rest bs) (mapcar #'gen-lexenv tn-refs)
+    (dolist (ap (all-parents a))
+      (when (every  (lambda (b) (parent-p ap b)) bs)
+       (return ap)))))
+
+
+
+
+(defun sort-according-to-live-range (tns)
+  (declare (optimize (debug 3)))
+  (loop
+    (catch 'found-one
+      (loop for ((tn-a . lambda-a) . rest) on tns
+         for i from 0
+         do
+           (loop for (tn-b . lambda-b) in rest
+              for j from (1+ i)
+              when (parent-p lambda-b lambda-a)
+              do
+                (rotatef (nth i tns) (nth j tns))
+                (throw 'found-one t)))
+      (return-from sort-according-to-live-range
+        (mapcar #'car tns)))))
