@@ -1560,58 +1560,56 @@
                (when target-fun
                  (funcall target-fun vop)))))
 
+
          ;; Pack wired TNs first.
          (collect ((verticies))
-         (do ((tn (ir2-component-wired-tns 2comp) (tn-next tn)))
-             ((null tn))
-           (pack-wired-tn tn optimize))
-
-           (if  (neq (sb-kind (sc-sb (tn-sc tn))) :unbounded)
-                (let ((vertex (make-vertex tn :wired)))
-                  (unless (member vertex (verticies)) ;;  (tn-offset tn)
-                    (verticies vertex)))
-                (pack-wired-tn tn optimize)))
-
-
-
-         ;; Pack restricted component TNs.
-
-         (do ((tn (ir2-component-restricted-tns 2comp) (tn-next tn)))
-             ((null tn))
-
-           (when (eq (tn-kind tn) :component)
+           (do ((tn (ir2-component-wired-tns 2comp) (tn-next tn)))
+               ((null tn))
              (if  (neq (sb-kind (sc-sb (tn-sc tn))) :unbounded)
-                  (let ((vertex (make-vertex tn :restricted))) ;fixme
+                  (let ((vertex (make-vertex tn :wired)))
                     (unless (member vertex (verticies)) ;;  (tn-offset tn)
                       (verticies vertex)))
-                  (pack-tn tn t optimize))))
+                  (pack-wired-tn tn optimize)))
 
 
-         ;; Pack other restricted TNs.
-         (do ((tn (ir2-component-restricted-tns 2comp) (tn-next tn)))
-             ((null tn))
+
+
+
+           ;; Pack restricted component TNs.
+
+           (do ((tn (ir2-component-restricted-tns 2comp) (tn-next tn)))
+               ((null tn))
+             (when (eq (tn-kind tn) :component)
+               (if  (neq (sb-kind (sc-sb (tn-sc tn))) :unbounded)
+                    (let ((vertex (make-vertex tn :restricted)))
+                      (unless (member vertex (verticies))
+                        (verticies vertex)))
+                    (pack-tn tn t optimize))))
+
+
+           ;; Pack other restricted TNs.
+           (do ((tn (ir2-component-restricted-tns 2comp) (tn-next tn)))
+               ((null tn))
 
              ;;(pack-tn tn t optimize)
              (if  (neq (sb-kind (sc-sb (tn-sc tn))) :unbounded)
                   (let ((vertex (make-vertex tn :restricted)))
                     (unless (member vertex (verticies)) ;;  (tn-offset tn)
                       (verticies vertex)))
-                  (pack-tn tn t optimize)
+                  (pack-tn tn t optimize)))
 
-             ))
+           ;; Assign costs to normal TNs so we know which ones should
+           ;; always be packed on the stack.
+           (when *pack-assign-costs*
+             (assign-tn-costs component)
+             (assign-tn-depths component))
 
-         ;; Assign costs to normal TNs so we know which ones should
-         ;; always be packed on the stack.
-         (when *pack-assign-costs*
-           (assign-tn-costs component)
-           (assign-tn-depths component))
+           ;; Allocate normal TNs, starting with the TNs that are used
+           ;; in deep loops.
 
-         ;; Allocate normal TNs, starting with the TNs that are used
-         ;; in deep loops.
-         (collect ((tns))
            (do-ir2-blocks (block component)
              (let ((ltns (ir2-block-local-tns block)))
-              ; (describe ltns)
+                                        ; (describe ltns)
                (do ((i (1- (ir2-block-local-tn-count block)) (1- i)))
                    ((minusp i))
                  (declare (fixnum i))
@@ -1631,68 +1629,74 @@
                                 (verticies vertex)))
                             (pack-tn tn t optimize))))))))
            #+no(dolist (tn (stable-sort (tns)
-                                    (lambda (a b)
-                                      (cond
-                                        ((> (tn-loop-depth a)
-                                            (tn-loop-depth b))
-                                         t)
-                                        ((= (tn-loop-depth a)
-                                            (tn-loop-depth b))
-                                         (> (tn-cost a) (tn-cost b)))
-                                        (t nil)))))
-             (unless (tn-offset tn)
-               ;(print (list tn "local conf" (tn-local-conflicts tn)))
-               ;; (print (list tn "global conf" (tn-global-conflicts tn)))
-               (when (sb-c::lambda-var-p (tn-leaf tn))
-                 (let* ((lambda (lambda-var-home (tn-leaf tn)))
-                        (parent (lambda-parent lambda))
-                        (child (lambda-children lambda)))
+                                        (lambda (a b)
+                                          (cond
+                                            ((> (tn-loop-depth a)
+                                                (tn-loop-depth b))
+                                             t)
+                                            ((= (tn-loop-depth a)
+                                                (tn-loop-depth b))
+                                             (> (tn-cost a) (tn-cost b)))
+                                            (t nil)))))
+                 (unless (tn-offset tn)
+                                        ;(print (list tn "local conf" (tn-local-conflicts tn)))
+                   ;; (print (list tn "global conf" (tn-global-conflicts tn)))
+                   (when (sb-c::lambda-var-p (tn-leaf tn))
+                     (let* ((lambda (lambda-var-home (tn-leaf tn)))
+                            (parent (lambda-parent lambda))
+                            (child (lambda-children lambda)))
 
-                  ; (print (list "lambda" lambda))
-                  ; (print (list "child" child))
-                  ; (print (list "parent" parent))
-                   ))
+                                        ; (print (list "lambda" lambda))
+                                        ; (print (list "child" child))
+                                        ; (print (list "parent" parent))
+                       ))
 
-         ;;      (when (typep (tn-leaf tn) 'sb-c:lambda-var)) ...)
-         ;;    oder (when (sb-c:lambda-varp (tn-leaf tn)) ...)
+                   ;;      (when (typep (tn-leaf tn) 'sb-c:lambda-var)) ...)
+                   ;;    oder (when (sb-c:lambda-varp (tn-leaf tn)) ...)
 
-               ;;(pack-tn tn nil optimize)
-               (print (list "type normal sorted"  tn))
-
-
-               (tns tn)))
+                   ;;(pack-tn tn nil optimize)
+                   (print (list "type normal sorted"  tn))
 
 
-         ;; Pack any leftover normal TNs. This is to deal with :MORE TNs,
-         ;; which could possibly not appear in any local TN map.
-         (do ((tn (ir2-component-normal-tns 2comp) (tn-next tn)))
-             ((null tn))
-;;           (unless (tn-offset tn)
+                   (tns tn)))
+
+
+           ;; Pack any leftover normal TNs. This is to deal with :MORE TNs,
+           ;; which could possibly not appear in any local TN map.
+           (do ((tn (ir2-component-normal-tns 2comp) (tn-next tn)))
+               ((null tn))
+             ;;           (unless (tn-offset tn)
              ;;(print tn)
-           (if  (neq (sb-kind (sc-sb (tn-sc tn))) :unbounded)
-                (let ((vertex (make-vertex tn :normal))) ;; fixme
-                  (unless (member vertex (verticies))
-                    (verticies vertex)))
-                (pack-tn tn t optimize)))
+             (if  (neq (sb-kind (sc-sb (tn-sc tn))) :unbounded)
+                  (let ((vertex (make-vertex tn :normal))) ;; fixme
+                    (unless (member vertex (verticies))
+                      (verticies vertex)))
+                  (pack-tn tn t optimize)))
 
-         (block nil
-           (handler-bind
-               ((error (lambda ()
-                         ;;(princ (list  "error" var ))
+           (block nil
+             (handler-bind
+                 ((error (lambda ()
+                           ;;(princ (list  "error" var ))
                                         ;(sb-debug:print-backtrace)
-                         (return-from nil))))
-             (let* ((verticies-temp (verticies))
-                    (interference (construct-interference verticies-temp))
-                    (colored-interference (color interference))
-                    (verticies (pack-colored colored-interference)))
-               ;;(print "starting packing")
-               (dolist (vertex verticies)
+                           (return-from nil))))
+               (let* ((verticies-temp (verticies))
+                      (interference (construct-interference verticies-temp))
+                      (colored-interference (color interference))
+                      (verticies (pack-colored colored-interference))
+                      ;; (total-len (length verticies))
+                      ;; (colored-len (length (filter-colored verticies)))
+		      )
 
-                 ;;(assert (equal (vertex-pack-type vertex) :normal))
-                 (unless (tn-offset (vertex-tn vertex))
-                   (pack-tn (vertex-tn vertex) nil optimize)
-                   ;; (print (list "leftovert " (vertex-tn vertex)))
-                   ))))))
+                  ;; (print (list "total" total-len "colored" colored-len))
+                  ;; (setf *total-tns* (+ *total-tns* total-len))
+                  ;; (setf *register* (+ *register* colored-len))
+                  ;; (print (list *total-tns*  *register*))
+                  ;;(print "starting packing")
+                  (dolist (vertex verticies)
+
+                    ;;(assert (equal (vertex-pack-type vertex) :normal))
+                    (unless (tn-offset (vertex-tn vertex))
+                      (pack-tn (vertex-tn vertex) nil optimize)))))))
          ;;(print "-------finished packing with pack-tn" )
          ;; Do load TN packing and emit saves.
          (let ((*repack-blocks* nil))
@@ -1715,9 +1719,12 @@
          (values))
     (clean-up-pack-structures)))
 
-
+;; (progn
+;; (defparameter *total-tns* 0)
+;; (defparameter *register* 0) )
 
 (progn
+
 
 ;; interference graph
 (def!struct (interference
@@ -1829,6 +1836,9 @@
 (defun filter-visible (verticies)
   (remove-if (lambda (a) (vertex-invisible a)) verticies))
 
+(defun filter-colored (verticies)
+  (remove-if (lambda (a) (equal (vertex-color a) nil)) verticies))
+
 ;; assuming that each neighbor of the vertex has the same sb
 (defun generate-color (vertex)
   (let* ((incidence (vertex-incidence vertex))
@@ -1939,6 +1949,7 @@
                 (progn
                   (setf (tn-offset tn) offset)
                   ;;(print (list "color-packed"  index tn (tn-offset tn) (tn-sc tn)))
+		  ;;(print "bla")
                   (pack-wired-tn (vertex-tn vertex) nil))
 
                 (progn
@@ -1953,14 +1964,9 @@
                   (assert (not (equal pack-type :wired)))
                   (if (equal pack-type :restricted)
                       (progn
-                        ;; (print "stick in the restricted variable that could not be colored")
-                        (pack-tn tn T nil)
-                        ;;(print (list  "stick in the restricted variable that could not be colored" tn))
-                        )
-                       ;;(print (list   "giving further" tn))
-                      ))))
+			(pack-tn tn T nil))))))
       (incf index))
-     verticies)))
+     verticies))) 
 
 
 
@@ -1971,26 +1977,3 @@
 
 
 
-
-
-
-
-
-
-
-
-(defun sort-according-to-live-range (tns)
-  (declare (optimize (debug 3)))
-  (loop
-    (catch 'found-one
-      (loop for ((tn-a . lambda-a) . rest) on tns
-         for i from 0
-         do
-           (loop for (tn-b . lambda-b) in rest
-              for j from (1+ i)
-              when (parent-p lambda-b lambda-a)
-              do
-                (rotatef (nth i tns) (nth j tns))
-                (throw 'found-one t)))
-      (return-from sort-according-to-live-range
-        (mapcar #'car tns)))))
