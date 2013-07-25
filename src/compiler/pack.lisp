@@ -39,6 +39,8 @@
 ;;;    that block.
 ;;; -- If TN is local, then we just check for a conflict in the block
 ;;;    it is local to.
+
+
 (defun offset-conflicts-in-sb (tn sb offset)
   (declare (type tn tn) (type finite-sb sb) (type index offset))
   (let ((confs (tn-global-conflicts tn))
@@ -48,10 +50,13 @@
       (let ((loc-live (svref (finite-sb-always-live sb) offset)))
         (dotimes (i (ir2-block-count *component-being-compiled*) nil)
           (when (/= (sbit loc-live i) 0)
-            (return t)))))
+            (progn  ;; (when debug-flag (print "cond1"))
+            (return t))))))
      (confs
       (let ((loc-confs (svref (finite-sb-conflicts sb) offset))
             (loc-live (svref (finite-sb-always-live sb) offset)))
+        ;; TN is global,
+        ;; iterate over the blocks TN is live in
         (do ((conf confs (global-conflicts-next-tnwise conf)))
             ((null conf)
              nil)
@@ -59,16 +64,25 @@
                  (num (ir2-block-number block)))
             (if (eq (global-conflicts-kind conf) :live)
                 (when (/= (sbit loc-live num) 0)
+                  (progn  ;; (when debug-flag (print (list "cond2" tn num offset)))
                   (return t))
+                  )
+                ;; global-conflicts-number TN's local TN number in
+                ;; BLOCK. :LIVE TNs don't have local numbers.
                 (when (/= (sbit (svref loc-confs num)
                                 (global-conflicts-number conf))
                           0)
-                  (return t)))))))
+                  (progn  ;; (when debug-flag (print (list "cond3: tn" tn "offset"  offset "num"  num "conf" conf )))
+                         (return t))
+                  ))))))
      (t
-      (/= (sbit (svref (svref (finite-sb-conflicts sb) offset)
-                       (ir2-block-number (tn-local tn)))
+
+      (let* ((num (ir2-block-number (tn-local tn)))
+             (temp (/= (sbit (svref (svref (finite-sb-conflicts sb) offset) num)
                 (tn-local-number tn))
-          0)))))
+          0)))  ;; (when (and  debug-flag  temp)   (print (list "cond4" tn " offset "  offset " num block "  num "num-tn " (tn-local-number tn) )))
+          temp
+        )))))
 
 ;;; Return true if TN has a conflict in SC at the specified offset.
 (defun conflicts-in-sc (tn sc offset)
@@ -107,6 +121,7 @@
           (dotimes (num (ir2-block-count *component-being-compiled*))
             (declare (type index num))
             (setf (sbit loc-live num) 1)
+            ;; (when (and (= offset 6) (= num 3)) (print (list "case 1 " tn)))
             (set-bit-vector (svref loc-confs num))))
          (confs
           (do ((conf confs (global-conflicts-next-tnwise conf)))
@@ -117,10 +132,26 @@
               (declare (type local-tn-bit-vector local-confs))
               (setf (sbit loc-live num) 1)
               (if (eq (global-conflicts-kind conf) :live)
-                  (set-bit-vector local-confs)
-                  (bit-ior local-confs (global-conflicts-conflicts conf) t)))))
+                  (progn
+                    ;; (when (and (= offset 6) (= num 3)) (print (list "case 2 " tn)))
+                    (set-bit-vector local-confs))
+                  (progn
+                     ;; (when (and (= offset 6) (= num 3)
+                     ;;            (= 1 (sbit  (global-conflicts-conflicts conf)  16)))
+                     ;;            (print (list "case 3 " tn )))
+                    ;; (when (and (= offset 6) (= num 3)
+                    ;;            (= 1 (sbit  (global-conflicts-conflicts conf)  12)))
+                    ;;   (print (list "case 3" tn (global-conflicts-conflicts conf) )))
+                    (bit-ior local-confs (global-conflicts-conflicts conf) t)
+
+                    )))))
          (t
           (let ((num (ir2-block-number (tn-local tn))))
+            ;; (when (and (= offset 12) (= num 18)
+            ;;                    (= 1 (sbit  (tn-local-conflicts tn)  16)))
+            ;;   (print (list "case 4 " tn )))
+            ;; (when (and (= offset 6) (= num 3))
+            ;;   (print (list "case 4 -some local bla is needed" tn)))
             (setf (sbit loc-live num) 1)
             (bit-ior (the local-tn-bit-vector (svref loc-confs num))
                      (tn-local-conflicts tn) t))))
@@ -1378,7 +1409,10 @@
                          (grow-sc sc)
                          (or (select-location original sc)
                              (error "failed to pack after growing SC?"))))))
+
+         ; (print (list "tn leaf" (tn-leaf tn)))
           (when loc
+           ;; (print (list "packed"  tn loc sc))
             (add-location-conflicts original sc loc optimize)
             (setf (tn-sc tn) sc)
             (setf (tn-offset tn) loc)
@@ -1443,7 +1477,8 @@
                          (or (= offset 0)
                              (= offset 1))))
                (conflicts-in-sc original sc offset))
-      (error "~S is wired to a location that it conflicts with." tn))
+      (error "~S is wired to location ~D in SC ~A of kind ~S that it conflicts with."
+             tn offset sc (tn-kind tn)))
 
     (add-location-conflicts original sc offset optimize)))
 
@@ -1526,21 +1561,44 @@
                  (funcall target-fun vop)))))
 
          ;; Pack wired TNs first.
+         (collect ((verticies))
          (do ((tn (ir2-component-wired-tns 2comp) (tn-next tn)))
              ((null tn))
            (pack-wired-tn tn optimize))
 
+           (if  (neq (sb-kind (sc-sb (tn-sc tn))) :unbounded)
+                (let ((vertex (make-vertex tn :wired)))
+                  (unless (member vertex (verticies)) ;;  (tn-offset tn)
+                    (verticies vertex)))
+                (pack-wired-tn tn optimize)))
+
+
+
          ;; Pack restricted component TNs.
+
          (do ((tn (ir2-component-restricted-tns 2comp) (tn-next tn)))
              ((null tn))
+
            (when (eq (tn-kind tn) :component)
-             (pack-tn tn t optimize)))
+             (if  (neq (sb-kind (sc-sb (tn-sc tn))) :unbounded)
+                  (let ((vertex (make-vertex tn :restricted))) ;fixme
+                    (unless (member vertex (verticies)) ;;  (tn-offset tn)
+                      (verticies vertex)))
+                  (pack-tn tn t optimize))))
+
 
          ;; Pack other restricted TNs.
          (do ((tn (ir2-component-restricted-tns 2comp) (tn-next tn)))
              ((null tn))
-           (unless (tn-offset tn)
-             (pack-tn tn t optimize)))
+
+             ;;(pack-tn tn t optimize)
+             (if  (neq (sb-kind (sc-sb (tn-sc tn))) :unbounded)
+                  (let ((vertex (make-vertex tn :restricted)))
+                    (unless (member vertex (verticies)) ;;  (tn-offset tn)
+                      (verticies vertex)))
+                  (pack-tn tn t optimize)
+
+             ))
 
          ;; Assign costs to normal TNs so we know which ones should
          ;; always be packed on the stack.
@@ -1553,6 +1611,7 @@
          (collect ((tns))
            (do-ir2-blocks (block component)
              (let ((ltns (ir2-block-local-tns block)))
+              ; (describe ltns)
                (do ((i (1- (ir2-block-local-tn-count block)) (1- i)))
                    ((minusp i))
                  (declare (fixnum i))
@@ -1564,9 +1623,14 @@
                      ;; well revert to the old behaviour of just
                      ;; packing TNs linearly as they appear.
                      (unless *loop-analyze*
-                       (pack-tn tn nil optimize))
-                     (tns tn))))))
-           (dolist (tn (stable-sort (tns)
+                       ;;(pack-tn tn nil optimize)
+
+                       (if  (neq (sb-kind (sc-sb (tn-sc tn))) :unbounded)
+                            (let ((vertex (make-vertex tn :normal)))
+                              (unless (member vertex (verticies)) ;;  (tn-offset tn)
+                                (verticies vertex)))
+                            (pack-tn tn t optimize))))))))
+           #+no(dolist (tn (stable-sort (tns)
                                     (lambda (a b)
                                       (cond
                                         ((> (tn-loop-depth a)
@@ -1577,29 +1641,59 @@
                                          (> (tn-cost a) (tn-cost b)))
                                         (t nil)))))
              (unless (tn-offset tn)
-               (pack-tn tn nil optimize))))
+               ;(print (list tn "local conf" (tn-local-conflicts tn)))
+               ;; (print (list tn "global conf" (tn-global-conflicts tn)))
+               (when (sb-c::lambda-var-p (tn-leaf tn))
+                 (let* ((lambda (lambda-var-home (tn-leaf tn)))
+                        (parent (lambda-parent lambda))
+                        (child (lambda-children lambda)))
+
+                  ; (print (list "lambda" lambda))
+                  ; (print (list "child" child))
+                  ; (print (list "parent" parent))
+                   ))
+
+         ;;      (when (typep (tn-leaf tn) 'sb-c:lambda-var)) ...)
+         ;;    oder (when (sb-c:lambda-varp (tn-leaf tn)) ...)
+
+               ;;(pack-tn tn nil optimize)
+               (print (list "type normal sorted"  tn))
+
+
+               (tns tn)))
+
 
          ;; Pack any leftover normal TNs. This is to deal with :MORE TNs,
          ;; which could possibly not appear in any local TN map.
-         (collect ((tns-parents))
-           (do ((tn (ir2-component-normal-tns 2comp) (tn-next tn)))
-               ((null tn))
-             (if (sc-is tn catch-block)
-                 (let ((refs  (gen-refs tn)))
-                   (if refs
-                     (let* ((parent (find-common-parent (gen-refs tn)))
-                            (tn-parent (cons tn parent)))
-                       (tns-parents tn-parent))
-                     (unless (tn-offset tn)
-                       (pack-tn tn nil optimize))))
-                 (unless (tn-offset tn)
-                   (pack-tn tn nil optimize))))
-           (let ((sorted-tns (sort-according-to-live-range
-                              (tns-parents))))
-             (dolist (tn  sorted-tns)
-                 (unless (tn-offset tn)
-                   (pack-tn tn nil optimize)))))
+         (do ((tn (ir2-component-normal-tns 2comp) (tn-next tn)))
+             ((null tn))
+;;           (unless (tn-offset tn)
+             ;;(print tn)
+           (if  (neq (sb-kind (sc-sb (tn-sc tn))) :unbounded)
+                (let ((vertex (make-vertex tn :normal))) ;; fixme
+                  (unless (member vertex (verticies))
+                    (verticies vertex)))
+                (pack-tn tn t optimize)))
 
+         (block nil
+           (handler-bind
+               ((error (lambda ()
+                         ;;(princ (list  "error" var ))
+                                        ;(sb-debug:print-backtrace)
+                         (return-from nil))))
+             (let* ((verticies-temp (verticies))
+                    (interference (construct-interference verticies-temp))
+                    (colored-interference (color interference))
+                    (verticies (pack-colored colored-interference)))
+               ;;(print "starting packing")
+               (dolist (vertex verticies)
+
+                 ;;(assert (equal (vertex-pack-type vertex) :normal))
+                 (unless (tn-offset (vertex-tn vertex))
+                   (pack-tn (vertex-tn vertex) nil optimize)
+                   ;; (print (list "leftovert " (vertex-tn vertex)))
+                   ))))))
+         ;;(print "-------finished packing with pack-tn" )
          ;; Do load TN packing and emit saves.
          (let ((*repack-blocks* nil))
            (cond ((and optimize *pack-optimize-saves*)
@@ -1623,45 +1717,264 @@
 
 
 
-(defun gen-lexenv (ref)
-  (let* ((vop (tn-ref-vop ref))
-         (node (vop-node vop))
-         (lexenv (node-lexenv node)))
-    (values (lexenv-lambda lexenv))))
+(progn
+
+;; interference graph
+(def!struct (interference
+             (:constructor make-interference (verticies)))
+    (number-verticies 0 :type fixnum)
+    ;; list of verticies in the interference graph
+    (verticies nil :type list))
 
 
-(defun gen-refs (tn)
-  (when (sc-is tn catch-block)
-    (collect ((refs))
-    (labels ((iter-ref (head)
-               (do ((ref head (tn-ref-next ref)))
-                 ((null ref))
-                 (refs ref))))
-      (iter-ref (tn-reads tn))
-      (iter-ref (tn-writes tn)))
-     (refs))))
+;; all TNS types are included in the graph, both with offset and without
+(defun construct-interference (verticies)
+  (let  ((interference (make-interference verticies)))
+    (dolist  (vertex verticies)
+      (let* ((tn (vertex-tn vertex))
+             (offset (tn-offset tn))
+             (sc (tn-sc tn)))
+        (when offset
+          (setf  (vertex-color vertex) (cons  offset sc)))))
+    (setf (interference-verticies interference) verticies)
+     (loop for (a . rest) on verticies
+        do (loop for b in rest
+              do
+
+                (let ((conflict (tns-conflict (vertex-tn a) (vertex-tn b))))
+                  (when conflict
+
+                  (push  a (vertex-incidence b))
+                  (push b (vertex-incidence a))
+                  ;; (print (list "vertex" a " and vertex " b ))
+                  ))))
+     interference))
+
+
+ ;; vertex in an interference graph
+ (def!struct  (vertex
+               (:constructor make-vertex (tn pack-type)))
+
+     ;; PLACE IN THE GRAPH STRUCTURE
+     ;; incidence list
+     ;; verticies (node numbers) that are adjacent to the node
+     ;; index vector
+     ;; FIXME
+
+
+     (incidence nil :type list)
+     ;; POINTER Back to TN
+     (tn nil :type tn)
+     ;; type of packing necessary
+     (pack-type nil :type (member :normal :wired :restricted))
 
 
 
-(defun all-parents (clambda)
-  (collect ((parents))
-    (do ((par  clambda (lambda-parent par)))
-           ((null par))
-          (parents par))
-    (parents)))
+     ;; PROPERTIES
+     ;; color = (cons offset sc)
+     (color nil :type (or cons null))
+    ;; (squeeze nil :type (or index null))
+     ;; type of packing necessary
+  ;;   (pack-type nil :type (or string null))
 
 
-;; for a and b :clambda
-(defun parent-p (a b)
-(unless (eq a b)
-  (find a (all-parents b))))
+     ;; STATUS
+     ;; is at the same time  marked for deletion
+     (spill-candidate nil :type t)
+     ;;  current status invisible  or not  (on stack or not)
+     (invisible nil :type t))
 
 
-(defun find-common-parent (tn-refs)
-  (destructuring-bind (a &rest bs) (mapcar #'gen-lexenv tn-refs)
-    (dolist (ap (all-parents a))
-      (when (every  (lambda (b) (parent-p ap b)) bs)
-       (return ap)))))
+(defun vertex-sc (vertex)
+  (tn-sc (vertex-tn vertex)))
+(defun vertex-k (vertex)
+  (let* ((sc   (vertex-sc vertex))
+         (k (length (sc-locations sc))))
+    k))
+
+(defun pop-from-stack (stack)
+  (let ((vertex (pop stack)))
+    vertex))
+
+;; select vertex that has a degree K;
+;; FIXME: possibilities for a heuristic
+(defun spill-candidate (vertex)
+  (setf (vertex-spill-candidate vertex) t)
+  (setf (vertex-invisible vertex) t)
+  vertex)
+
+(defun color-candidate (vertex)
+  (setf (vertex-invisible vertex) t)
+  vertex)
+
+
+
+ ;; length of the adjacency list
+(defun vertex-degree (vertex)
+  ;; count-if
+  (count-if  (lambda (a) (neq nil (vertex-invisible a))) (vertex-incidence vertex)))
+
+;; assign color different than the colored neighbors
+(defun color-vertex (vertex color)
+  (setf (vertex-color vertex) color))
+
+(defun sort-according-to-degree (verticies)
+  (sort (copy-list verticies)
+        (lambda (a b) (> (vertex-degree a) (vertex-degree b)))))
+
+(defun sort-according-to-pack-type (verticies)
+  (sort (copy-list verticies) (lambda (x y) (string-not-lessp (subseq  (string (vertex-pack-type x)) 0 1)
+                                                       (subseq  (string (vertex-pack-type y)) 0 1)))))
+
+(defun filter-visible (verticies)
+  (remove-if (lambda (a) (vertex-invisible a)) verticies))
+
+;; assuming that each neighbor of the vertex has the same sb
+(defun generate-color (vertex)
+  (let* ((incidence (vertex-incidence vertex))
+         (visibles (filter-visible incidence))
+         (sc (vertex-sc vertex))
+         (all-locations (sc-locations sc))
+         (reserved (sc-reserve-locations sc))
+         ;; FIXME; is it necessary?
+         (locations (remove-if (lambda (x) (member x reserved)) all-locations))
+         (element-size (sc-element-size sc)))
+    ;; iterate over SB locations with SC index
+    (dolist (loc locations)
+      ;;iterate over colored incidence elements
+      (block try-loc
+        (dolist (color   (mapcar  (lambda (c)  (vertex-color c)) visibles))
+          (assert color)
+          (destructuring-bind (offset-neighbor . sc-neighbor)  color
+            (let ((element-size-neighbor (sc-element-size sc-neighbor)))
+              (dotimes (el element-size)
+                (when
+                    (<= offset-neighbor
+                        (+ loc el)
+                        (+ offset-neighbor element-size-neighbor -1))
+                  (return-from try-loc))))))
+        (return-from generate-color (cons loc sc))))))
+
+;; assign color to the last slot on the stack
+;; iterate over stack
+(defun assign-color (color vertex)
+  (color-vertex vertex color)
+  (setf (vertex-invisible vertex) nil))
+
+(defparameter sb!c::*precoloring-stack* '())
+(defparameter sb!c::*prespilling-stack* '())
+
+; coloring the interference graph
+; assumption ; k registers are free
+
+(defun color (interference)
+  (setf sb!c::*precoloring-stack* '())
+  (setf sb!c::*prespilling-stack* '())
+  ;; FIXME: we assume that the number of free slots corresponds to the
+  ;; location LENGTH on the sb
+
+    (let ((sorted-vertex (sort-according-to-degree (interference-verticies interference))))
+      (do ((vertex (first sorted-vertex)  (first sorted-vertex)))
+          ((null vertex))
+        (setf sorted-vertex (sort-according-to-degree (filter-visible (rest sorted-vertex))))
+      ;(dolist (vertex sorted-vertex)
+       (unless (vertex-color vertex)
+;       (print (vertex-tn vertex))
+        (let ((k (vertex-k vertex)))
+          (if (< (vertex-degree vertex) k)
+              (progn
+                (color-candidate vertex)
+                (push vertex sb!c::*precoloring-stack*))
+              (progn
+                (spill-candidate vertex)
+                (push vertex sb!c::*prespilling-stack*))))
+        ;;(print (list "processed vertex" vertex (vertex-degree vertex)))
+          )))
+
+
+
+  (do ((vertex (pop sb!c::*precoloring-stack*)  (pop sb!c::*precoloring-stack*)  ))
+      ((null vertex))
+    (let ((color (generate-color vertex)))
+      ;;(print (list "color + tn"  (vertex-tn vertex) color))
+      (when color
+        (assign-color color vertex))))
+
+
+  (do ((vertex  (pop sb!c::*prespilling-stack*)  (pop sb!c::*prespilling-stack*)))
+        ((null vertex))
+      (let ((color (generate-color vertex)))
+        ;;(print (list "color + tn" (vertex-tn vertex) color))
+        (when color
+          (assign-color color vertex))))
+
+  interference)
+
+
+(defun pack-colored (colored-interference)
+  (let* ((unsorted (interference-verticies colored-interference))
+         (verticies (sort-according-to-pack-type unsorted))
+         (index 0)
+         )
+
+    ;; (when   ( > (length verticies) 153)
+    ;;   (setf debug-flag T)
+    ;;   (print (list "conflicts " (tns-conflict (vertex-tn (nth 6 verticies)) (vertex-tn (nth 153 verticies)))))
+    ;;   (print (list  "conflicts"  (tns-conflict (vertex-tn (nth 153 verticies)) (vertex-tn (nth 6 verticies)))))
+    ;;   (setf debug-flag nil)
+    ;;  )
+
+    (dolist (vertex verticies)
+
+      (let* ((color (vertex-color vertex))
+             (offset (car color))
+             (tn (vertex-tn vertex))
+            ;; (tn-kind (tn-kind tn))
+             (pack-type (vertex-pack-type vertex)))
+        ;; (dolist (neighbor (vertex-incidence vertex))
+        ;;   (assert  (not (equal (vertex-color vertex) (vertex-color neighbor)))))
+
+        (if  (and offset (not (conflicts-in-sc  tn (tn-sc tn) offset)))
+;;      (if offset
+                (progn
+                  (setf (tn-offset tn) offset)
+                  ;;(print (list "color-packed"  index tn (tn-offset tn) (tn-sc tn)))
+                  (pack-wired-tn (vertex-tn vertex) nil))
+
+                (progn
+                ;; (when (and offset (conflicts-in-sc tn (tn-sc tn) offset))
+                ;;   (setf debug-flag T)
+                ;;   (conflicts-in-sc  tn (tn-sc tn) offset)
+                ;;   (setf debug-flag nil)
+                ;;   )
+                  ;;(print (list "old"  index tn  (vertex-spill-candidate vertex) offset))
+
+
+                  (assert (not (equal pack-type :wired)))
+                  (if (equal pack-type :restricted)
+                      (progn
+                        ;; (print "stick in the restricted variable that could not be colored")
+                        (pack-tn tn T nil)
+                        ;;(print (list  "stick in the restricted variable that could not be colored" tn))
+                        )
+                       ;;(print (list   "giving further" tn))
+                      ))))
+      (incf index))
+     verticies)))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

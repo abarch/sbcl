@@ -457,7 +457,9 @@
                         prev))))
         (do ((b last (ir2-block-prev b)))
             ((not (eq (ir2-block-block b) block)))
-          (setup-environment-tn-conflict tn b debug-p)))
+          (setup-environment-tn-conflict tn b debug-p)
+;;        (print tn)
+          ))
       ;; If BLOCK ends with a TAIL LOCAL COMBINATION and TN is an
       ;; "implicit value cell" then setup conflicts for the callee
       ;; function as well.
@@ -623,6 +625,8 @@
   (do ((live live-list (tn-next* live)))
       ((null live))
     (setf (sbit (tn-local-conflicts live) num) 1))
+  ;;(print tn)
+  ;;(print (tn-local-conflicts tn))
   (values))
 
 ;;; Compute a bit vector of the TNs live after VOP that aren't results.
@@ -1041,7 +1045,8 @@
          (x-num (ir2-block-number (global-conflicts-block x-conf)))
          (y-conf (tn-global-conflicts y))
          (y-num (ir2-block-number (global-conflicts-block y-conf))))
-
+                                        ;   (when debug-flag (print (list "xconf, yconf"  x-num y-num x-conf y-conf)) (break))
+    ;; (when debug-flag (break))
     (macrolet ((advance (n c)
                  `(progn
                     (setq ,c (global-conflicts-next-tnwise ,c))
@@ -1050,22 +1055,22 @@
                (scan (g l lc)
                  `(do ()
                       ((>= ,l ,g))
-		    (advance ,l ,lc))))
+                    (advance ,l ,lc))))
 
       (loop
-	 ;; x-conf, y-conf true, x-num, y-num corresponding block numbers.
-	 (scan x-num y-num y-conf)
-	 (scan y-num x-num x-conf)
+         ;; x-conf, y-conf true, x-num, y-num corresponding block numbers.
+         (scan x-num y-num y-conf)
+         (scan y-num x-num x-conf)
 
-	 (when (= x-num y-num)
-	   (let ((ltn-num-x (global-conflicts-number x-conf))
-		 (ltn-num-y (global-conflicts-number y-conf)))
-	     (unless (and ltn-num-x ltn-num-y
-			  (zerop (sbit (global-conflicts-conflicts y-conf)
-				       ltn-num-x)))
-	       (return t))
-	     (advance x-num x-conf)
-	     (advance y-num y-conf)))))))
+         (when (= x-num y-num)
+           (let ((ltn-num-x (global-conflicts-number x-conf))
+                 (ltn-num-y (global-conflicts-number y-conf)))
+             (unless (and ltn-num-x ltn-num-y
+                          (zerop (sbit (global-conflicts-conflicts y-conf)
+                                       ltn-num-x)))
+               (return t))
+             (advance x-num x-conf)
+             (advance y-num y-conf)))))))
 
 ;;; Return true if X and Y are distinct and the lifetimes of X and Y
 ;;; overlap at any point.
@@ -1074,14 +1079,26 @@
   (let ((x-kind (tn-kind x))
         (y-kind (tn-kind y)))
     (cond ((eq x y) nil)
-          ((or (eq x-kind :component) (eq y-kind :component)) t)
+          ((or (eq x-kind :component) (eq y-kind :component))
+           (progn ;; (when debug-flag (print (list "tns-case0" x y)))
+                  t))
           ((tn-global-conflicts x)
            (if (tn-global-conflicts y)
-               (tns-conflict-global-global x y)
-               (tns-conflict-local-global y x)))
+               (progn ;; (when debug-flag  (print (list "tns-case1" x y))
+               ;; )
+                 (tns-conflict-global-global x y)
+                      )
+               (progn  ;; (when debug-flag (print "tns-case2"))
+                 (tns-conflict-local-global y x)
+                       )
+                 ))
           ((tn-global-conflicts y)
-           (tns-conflict-local-global x y))
+           (progn ;; (when debug-flag (print "tns-case3"))
+                  (tns-conflict-local-global x y))
+                 )
           (t
+           (progn ;; (when debug-flag (print "tns-case4"))
            (and (eq (tn-local x) (tn-local y))
                 (not (zerop (sbit (tn-local-conflicts x)
-                                  (tn-local-number y)))))))))
+                                  (tn-local-number y))))))))))
+
