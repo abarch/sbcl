@@ -1850,7 +1850,7 @@
   (remove-if (lambda (a) (vertex-invisible a)) verticies))
 
 (defun filter-invisible (verticies)
-  (remove-if (lambda (a) (not (vertex-invisible a)) verticies)))
+  (remove-if (lambda (a) (not (vertex-invisible a))) verticies))
 
 (defun filter-color-candidate (verticies)
   (remove-if (lambda (a)  (vertex-spill-candidate a)) verticies))
@@ -1966,10 +1966,10 @@
   (labels ((iter (vert)
              ;;(print "iterating")
              (let* ((interference (construct-interference vert))
-                    (number-of-colored-before (length (filter-colored (interference-verticies interference))))
+                    ;; (number-of-colored-before (length (filter-colored (interference-verticies interference))))
                     (colored (color interference))
                     (spill-candidates  (filter-normal (filter-uncolored (interference-verticies colored))))
-                    (number-of-colored (length (filter-colored (interference-verticies colored))))
+                    ;; (number-of-colored (length (filter-colored (interference-verticies colored))))
 
 )
 
