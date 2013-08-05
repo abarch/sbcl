@@ -1682,10 +1682,14 @@
                                         ;(sb-debug:print-backtrace)
                            (return-from nil))))
                (let* ((verticies-temp (verticies))
-                      (interference (construct-interference verticies-temp))
-                      (colored-interference (color interference))
-                      (verticies (pack-colored colored-interference))
-                      ;; (total-len (length verticies))
+                      (verticies (pack-colored (iterate-color verticies-temp)))
+
+                      ;; case when we do only one iteration
+                      ;;(colored-interference (color interference))
+                      ;;(verticies (pack-colored colored-interference))
+
+
+                      ;;(total-len (length verticies))
                       ;; (colored-len (length (filter-colored verticies)))
 		      )
 
