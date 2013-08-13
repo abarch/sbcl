@@ -777,6 +777,7 @@
 ;;; stack in units of the number of references. We count all
 ;;; references as +1, and subtract out REGISTER-SAVE-PENALTY for each
 ;;; place where we would have to save a register.
+;;; write references are prioritized with +2
 (defun assign-tn-costs (component)
   (do-ir2-blocks (block component)
     (do ((vop (ir2-block-start-vop block) (vop-next vop)))
@@ -795,7 +796,7 @@
         (incf cost))
       (do ((ref (tn-writes tn) (tn-ref-next ref)))
           ((null ref))
-        (incf cost))
+        (incf cost 2))
       (setf (tn-cost tn) cost))))
 
 ;;; Iterate over the normal TNs, storing the depth of the deepest loop
@@ -1398,6 +1399,7 @@
           (pack-tn save nil optimize))
         (setf (tn-offset tn) (tn-offset save))
         (setf (tn-sc tn) (tn-sc save))
+        (tn-allocation tn)
         (return))
       (when (or restricted
                 (not (and (minusp (tn-cost tn)) (sc-save-p sc))))
@@ -1416,7 +1418,7 @@
             (add-location-conflicts original sc loc optimize)
             (setf (tn-sc tn) sc)
             (setf (tn-offset tn) loc)
-           ;; (tn-allocation tn)
+            (tn-allocation tn)
             (return))))))
   (values))
 
@@ -1482,7 +1484,7 @@
              tn offset sc (tn-kind tn)))
 
     (add-location-conflicts original sc offset optimize)
-   ;; (tn-allocation tn)
+    (tn-allocation tn)
     ))
 
 (defevent repack-block "Repacked a block due to TN unpacking.")
@@ -1532,8 +1534,65 @@
         (setf (finite-sb-live-tns sb)
               (make-array size :initial-element nil))))))
 
+
+
+;;   du kannst umgebungvariablen verwenden
+;; (sb-posix:getenv "DEBUG_FILENAME") 06:55:10 PM
+;; und dann vor dem starten des programms 06:55:17 PM
+;; export DEBUG_FILENAME=meinedatei.txt
+
+;; (with-open-file (stream "file.txt" :direction :output) (write DATA stream))
+;; (let ((*print-pretty* t) (*print-right-margin* 70) (*print-miser-width* 70)) BODY)
+;; (format stream "~A ~A ~A~%" spalte-1 spalte-2 spalte 3)
+
+
+(defparameter *count* 0)
+(defparameter *total* 0)
+(defparameter *spill-cost* 0)
+
+
+
+(defparameter *count-all* 0)
+(defparameter *total-all* 0)
+(defparameter *spill-cost-all* 0) 
+
+
+;; method :new or :old 
+(defparameter *reg-alloc-method* :new)
+(defparameter *output* "/homes/abarch/google/sbcl/stats/file.txt")
+
 (defun pack (component)
+;;  (print (component-name component))
+  (setf *count* 0)
+  (setf *total* 0)
+  (setf *spill-cost* 0)
+
+
+  (setf *count-all* 0) 
+  (setf *total-all* 0)
+  (setf *spill-cost-all* 0)
+
+
+
+
+  (if (equal *reg-alloc-method* :new)
+      (pack-new component)
+      (pack-old component))
+  (let* ((result-regs
+	  (format nil "~D ~D ~D ~D "  *count* *total* *spill-cost* (if (= *total* 0) 0 (float (/ *count* *total*)))))
+	 (result-all
+	  (format nil "~D ~D ~D ~D "  *count-all* *total-all* *spill-cost-all* (if (= *total-all* 0) 0 (float (/ *count-all* *total-all*)))))
+	 (result (concatenate 'string  result-regs " " result-all))
+	 
+        (out (open *output* :direction :output :if-does-not-exist :create :if-exists :append)))
+    (write-line  result out)
+    (close out)))
+
+
+
+(defun pack-new (component)
   (unwind-protect
+       ;; (print (list "pack-new" (component-name component)))
        (let ((optimize nil)
              (2comp (component-info component)))
          (init-sb-vectors component)
@@ -1568,37 +1627,32 @@
          (collect ((verticies))
            (do ((tn (ir2-component-wired-tns 2comp) (tn-next tn)))
                ((null tn))
-             (if  (neq (sb-kind (sc-sb (tn-sc tn))) :unbounded)
-                  (let ((vertex (make-vertex tn :wired)))
-                    (unless (member vertex (verticies)) ;;  (tn-offset tn)
-                      (verticies vertex)))
-                  (pack-wired-tn tn optimize)))
-
-
-
+             (pack-wired-tn tn optimize)
+             (let ((vertex (make-vertex tn :wired)))
+                    (unless (member vertex (vertices)) ;;  (tn-offset tn)
+                      (vertices vertex))))
 
 
            ;; Pack restricted component TNs.
            (do ((tn (ir2-component-restricted-tns 2comp) (tn-next tn)))
                ((null tn))
              (when (eq (tn-kind tn) :component)
-               (if  (neq (sb-kind (sc-sb (tn-sc tn))) :unbounded)
-                    (let ((vertex (make-vertex tn :restricted)))
-                      (unless (member vertex (verticies))
-                        (verticies vertex)))
-                    (pack-tn tn t optimize))))
+               (pack-tn tn t optimize)
+               (let ((vertex (make-vertex tn :restricted)))
+                      (unless (member vertex (vertices))
+                        (vertices vertex)))))
+
 
 
            ;; Pack other restricted TNs.
            (do ((tn (ir2-component-restricted-tns 2comp) (tn-next tn)))
                ((null tn))
-
+             (unless (tn-offset tn)
+               (pack-tn tn t optimize))
              ;;(pack-tn tn t optimize)
-             (if  (neq (sb-kind (sc-sb (tn-sc tn))) :unbounded)
-                  (let ((vertex (make-vertex tn :restricted)))
-                    (unless (member vertex (verticies)) ;;  (tn-offset tn)
-                      (verticies vertex)))
-                  (pack-tn tn t optimize)))
+             (let ((vertex (make-vertex tn :restricted)))
+               (unless (member vertex (vertices)) ;;  (tn-offset tn)
+                 (vertices vertex))))
 
            ;; Assign costs to normal TNs so we know which ones should
            ;; always be packed on the stack.
@@ -1681,28 +1735,17 @@
                            ;;(princ (list  "error" var ))
                                         ;(sb-debug:print-backtrace)
                            (return-from nil))))
-               (let* ((verticies-temp (verticies))
-                      (verticies (pack-colored (iterate-color verticies-temp)))
-
-                      ;; case when we do only one iteration
-                      ;;(colored-interference (color interference))
-                      ;;(verticies (pack-colored colored-interference))
-
-
-                      ;;(total-len (length verticies))
-                      ;; (colored-len (length (filter-colored verticies)))
-		      )
-
-                  ;; (print (list "total" total-len "colored" colored-len))
-                  ;; (setf *total-tns* (+ *total-tns* total-len))
-                  ;; (setf *register* (+ *register* colored-len))
-                  ;; (print (list *total-tns*  *register*))
-                  ;;(print "starting packing")
-                  (dolist (vertex verticies)
-
-                    ;;(assert (equal (vertex-pack-type vertex) :normal))
-                    (unless (tn-offset (vertex-tn vertex))
-                      (pack-tn (vertex-tn vertex) nil optimize)))))))
+               (let* ((vertices-temp (vertices))
+                      (vertices (pack-colored (iterate-color vertices-temp))))
+                 (dolist (vertex vertices)
+                   (let ((tn (vertex-tn vertex)))
+                    (unless (tn-offset tn)
+                      (pack-tn tn nil optimize)
+                      (incf *total*)
+                      (if  (not (equal (sb-kind (sc-sb (tn-sc tn))) :unbounded))
+                          (incf *count*)
+                          (incf *spill-cost* (spill-cost tn) )
+                          ))))))))
          ;;(print "-------finished packing with pack-tn" )
          ;; Do load TN packing and emit saves.
          (let ((*repack-blocks* nil))
@@ -1726,23 +1769,26 @@
     (clean-up-pack-structures)))
 
 
-(progn
-;; (progn
-;; (defparameter *flag* T)
-;; (defparameter *count* 0)
-;; (defparameter *total* 0) )
 
-;; (defun tn-allocation (tn)
-;;   (incf *total*)
-;;   (when (not (equal (sb-kind (sc-sb (tn-sc tn))) :unbounded))
-;;           (incf *count*)))
+(progn
+
+
+(defun spill-cost (tn)
+  (* (1+ (tn-loop-depth tn)) (tn-cost tn)))
+
+(defun tn-allocation (tn)
+  (incf *total-all*)
+
+  (if (not (equal (sb-kind (sc-sb (tn-sc tn))) :unbounded))
+      (incf *count-all*)
+      (incf *spill-cost-all* (spill-cost tn) )))
 
 ;; interference graph
 (def!struct (interference
-             (:constructor make-interference (verticies)))
-    (number-verticies 0 :type fixnum)
-    ;; list of verticies in the interference graph
-    (verticies nil :type list))
+             (:constructor make-interference (vertices)))
+    (number-vertices 0 :type fixnum)
+    ;; list of vertices in the interference graph
+    (vertices nil :type list))
 
 
 ;; all TNS types are included in the graph, both with offset and without
@@ -1850,8 +1896,16 @@
   (sort (copy-list verticies) (lambda (x y) (string-not-lessp (subseq  (string (vertex-pack-type x)) 0 1)
                                                        (subseq  (string (vertex-pack-type y)) 0 1)))))
 
-(defun filter-visible (verticies)
-  (remove-if (lambda (a) (vertex-invisible a)) verticies))
+(defun sort-according-to-degree-cost (verticies)
+  (sort (copy-list  verticies)
+        (lambda (a b) (cond (( < (vertex-degree a) (vertex-degree b)) t)
+                            ((=  (vertex-degree a) (vertex-degree b))
+                             (> (spill-cost (vertex-tn a)) (spill-cost (vertex-tn b))))
+                            (t nil)))))
+
+
+(defun filter-visible (vertices)
+  (remove-if (lambda (a) (vertex-invisible a)) vertices))
 
 (defun filter-invisible (verticies)
   (remove-if (lambda (a) (not (vertex-invisible a))) verticies))
@@ -1913,15 +1967,14 @@
 (defun color (interference)
   (setf sb!c::*precoloring-stack* '())
   (setf sb!c::*prespilling-stack* '())
-  ;; FIXME: we assume that the number of free slots corresponds to the
-  ;; location LENGTH on the sb
+  
+     ;;(let ((sorted-vertex (sort-according-to-degree-cost (interference-vertices interference))))
+      ;; (do ((vertex (first sorted-vertex)  (first sorted-vertex)))
+       ;;    ((null vertex))
+        ;; (setf sorted-vertex (sort-according-to-degree-cost (filter-visible (rest sorted-vertex))))
 
-    ;; (let ((sorted-vertex (sort-according-to-degree (interference-verticies interference))))
-    ;;   (do ((vertex (first sorted-vertex)  (first sorted-vertex)))
-    ;;       ((null vertex))
-    ;;     (setf sorted-vertex (sort-according-to-degree (filter-visible (rest sorted-vertex))))
-      ;(dolist (vertex sorted-vertex)
-  (dolist (vertex (interference-verticies interference))
+
+  (dolist (vertex (interference-vertices interference))
        (unless (vertex-color vertex)
 ;       (print (vertex-tn vertex))
         (let ((k (vertex-k vertex)))
@@ -2017,58 +2070,166 @@
 
 
 
-(defun pack-colored (colored-verticies)
-  (let ((verticies (sort-according-to-pack-type colored-verticies))
-         (index 0)
-         )
 
-    ;; (when   ( > (length verticies) 153)
-    ;;   (setf debug-flag T)
-    ;;   (print (list "conflicts " (tns-conflict (vertex-tn (nth 6 verticies)) (vertex-tn (nth 153 verticies)))))
-    ;;   (print (list  "conflicts"  (tns-conflict (vertex-tn (nth 153 verticies)) (vertex-tn (nth 6 verticies)))))
-    ;;   (setf debug-flag nil)
-    ;;  )
-
-    (dolist (vertex verticies)
+(defun pack-colored (colored-vertices)
+;;  (print "pack-colored")
+  ;;(let (;(vertices (sort-according-to-pack-type colored-vertices))
+    ;;     (index 0))
+    (dolist (vertex colored-vertices) ;;  vertices)
 
       (let* ((color (vertex-color vertex))
              (offset (car color))
              (tn (vertex-tn vertex))
+             (tn-offset (tn-offset tn)))
             ;; (tn-kind (tn-kind tn))
-             (pack-type (vertex-pack-type vertex)))
+             ;;(pack-type (vertex-pack-type vertex))
+
         ;; (dolist (neighbor (vertex-incidence vertex))
         ;;   (assert  (not (equal (vertex-color vertex) (vertex-color neighbor)))))
 
-        (if  (and offset (not (conflicts-in-sc  tn (tn-sc tn) offset)))
-;;      (if offset
-                (progn
-                  (setf (tn-offset tn) offset)
-                  ;;(print (list "color-packed"  index tn (tn-offset tn) (tn-sc tn)))
-		  ;;(print "bla")
-                  (pack-wired-tn (vertex-tn vertex) nil))
 
-                (progn
-                ;; (when (and offset (conflicts-in-sc tn (tn-sc tn) offset))
-                ;;   (setf debug-flag T)
-                ;;   (conflicts-in-sc  tn (tn-sc tn) offset)
-                ;;   (setf debug-flag nil)
-                ;;   )
-                  ;;(print (list "old"  index tn  (vertex-spill-candidate vertex) offset))
+        ;; colored  but the tn is not packed yet
+        (when (and offset (not tn-offset))
+          (assert (not (conflicts-in-sc  tn (tn-sc tn) offset)))
+          ;;(print "packing colored tn" tn)
+          (setf (tn-offset tn) offset)
+          (incf *total*)
+          (incf *count*)
 
-
-                  (assert (not (equal pack-type :wired)))
-                  (if (equal pack-type :restricted)
-                      (progn
-			(pack-tn tn T nil))))))
-      (incf index))
-     verticies))) 
+          (pack-wired-tn (vertex-tn vertex) nil))))
+              ;; no color generated and the tn is not packed
+     colored-vertices))
 
 
 
 
 
+(defun pack-old (component)
+  (unwind-protect
+       ;;(print (list "pack-old" (component-name component)))
+       (let ((optimize nil)
+             (2comp (component-info component)))
+         (init-sb-vectors component)
 
+         ;; Determine whether we want to do more expensive packing by
+         ;; checking whether any blocks in the component have (> SPEED
+         ;; COMPILE-SPEED).
+         ;;
+         ;; FIXME: This means that a declaration can have a minor
+         ;; effect even outside its scope, and as the packing is done
+         ;; component-globally it'd be tricky to use strict scoping. I
+         ;; think this is still acceptable since it's just a tradeoff
+         ;; between compilation speed and allocation quality and
+         ;; doesn't affect the semantics of the generated code in any
+         ;; way. -- JES 2004-10-06
+         (do-ir2-blocks (block component)
+           (when (policy (block-last (ir2-block-block block))
+                         (> speed compilation-speed))
+             (setf optimize t)
+             (return)))
 
+         ;; Call the target functions.
+         (do-ir2-blocks (block component)
+           (do ((vop (ir2-block-start-vop block) (vop-next vop)))
+               ((null vop))
+             (let ((target-fun (vop-info-target-fun (vop-info vop))))
+               (when target-fun
+                 (funcall target-fun vop)))))
 
+         ;; Pack wired TNs first.
+         (do ((tn (ir2-component-wired-tns 2comp) (tn-next tn)))
+             ((null tn))
+           (pack-wired-tn tn optimize)
+        )
 
+         ;; Pack restricted component TNs.
+         (do ((tn (ir2-component-restricted-tns 2comp) (tn-next tn)))
+             ((null tn))
+           (when (eq (tn-kind tn) :component)
+             (pack-tn tn t optimize)
+          ))
 
+         ;; Pack other restricted TNs.
+         (do ((tn (ir2-component-restricted-tns 2comp) (tn-next tn)))
+             ((null tn))
+           (unless (tn-offset tn)
+             (pack-tn tn t optimize)))
+
+         ;; Assign costs to normal TNs so we know which ones should
+         ;; always be packed on the stack.
+         (when *pack-assign-costs*
+           (assign-tn-costs component)
+           (assign-tn-depths component))
+
+         ;; Allocate normal TNs, starting with the TNs that are used
+         ;; in deep loops.
+         (collect ((tns))
+           (do-ir2-blocks (block component)
+             (let ((ltns (ir2-block-local-tns block)))
+               (do ((i (1- (ir2-block-local-tn-count block)) (1- i)))
+                   ((minusp i))
+                 (declare (fixnum i))
+                 (let ((tn (svref ltns i)))
+                   (unless (or (null tn)
+                               (eq tn :more)
+                               (tn-offset tn))
+                     ;; If loop analysis has been disabled we might as
+                     ;; well revert to the old behaviour of just
+                     ;; packing TNs linearly as they appear.
+                     (unless *loop-analyze*
+                       (pack-tn tn nil optimize))
+                     (tns tn))))))
+           (dolist (tn (stable-sort (tns)
+                                    (lambda (a b)
+                                      (cond
+                                        ((> (tn-loop-depth a)
+                                            (tn-loop-depth b))
+                                         t)
+                                        ((= (tn-loop-depth a)
+                                            (tn-loop-depth b))
+                                         (> (tn-cost a) (tn-cost b)))
+                                        (t nil)))))
+
+             (unless (tn-offset tn)
+               (let ((sc-old  (equal (sb-kind (sc-sb (tn-sc tn))) :unbounded)))
+                 (pack-tn tn nil optimize)
+                 (when (not sc-old) (incf *total*)
+                       (let ((sc-new (equal (sb-kind (sc-sb (tn-sc tn)))  :unbounded)))
+                         (if (not sc-new) (incf *count*) (incf *spill-cost* (spill-cost tn) )))
+                 )))))
+
+         ;; Pack any leftover normal TNs. This is to deal with :MORE TNs,
+         ;; which could possibly not appear in any local TN map.
+         (do ((tn (ir2-component-normal-tns 2comp) (tn-next tn)))
+             ((null tn))
+
+           (unless (tn-offset tn)
+             (let ((sc-old  (equal (sb-kind (sc-sb (tn-sc tn))) :unbounded)))
+                 (pack-tn tn nil optimize)
+                 (when (not sc-old) (incf *total*)
+                       (let ((sc-new (equal (sb-kind (sc-sb (tn-sc tn)))  :unbounded)))
+                         (if (not sc-new) (incf *count*) (incf *spill-cost* (spill-cost tn) )))
+                 ))))
+
+             ;;(pack-tn tn nil optimize)))
+
+         ;; Do load TN packing and emit saves.
+         (let ((*repack-blocks* nil))
+           (cond ((and optimize *pack-optimize-saves*)
+                  (optimized-emit-saves component)
+                  (do-ir2-blocks (block component)
+                    (pack-load-tns block)))
+                 (t
+                  (do-ir2-blocks (block component)
+                    (emit-saves block)
+                    (pack-load-tns block))))
+           (loop
+              (unless *repack-blocks* (return))
+              (let ((orpb *repack-blocks*))
+                (setq *repack-blocks* nil)
+                (dolist (block orpb)
+                  (event repack-block)
+                  (pack-load-tns block)))))
+
+         (values))
+    (clean-up-pack-structures)))
