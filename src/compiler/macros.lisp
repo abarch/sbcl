@@ -821,10 +821,11 @@
 
 ;;; Note that the event with the specified NAME has happened. NODE is
 ;;; evaluated to determine the node to which the event happened.
-(defmacro event (name &optional node)
+(defmacro event (name &optional node data)
   ;; Increment the counter and do any action. Mumble about the event if
   ;; policy indicates.
-  `(%event ,(event-info-var (event-info-or-lose name)) ,node))
+  `(%event ,(event-info-var (event-info-or-lose name)) ,node ,data))
+
 
 ;;; Print a listing of events and their counts, sorted by the count.
 ;;; Events that happened fewer than Min-Count times will not be

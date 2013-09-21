@@ -1592,6 +1592,22 @@
 
 
 
+(defevent pack-done "PACK assigned SB locations to all component TNs.")
+
+
+;; (setf (sb-c::event-action 'sb-c::pack-done)
+;;             (lambda (node data)
+;;               (declare (ignore node))
+;;               (let ((context (sb-c::find-error-context '())))
+;;                 (when context
+;;                   (format t "~&~A:~A~%"
+;;                           (sb-c::compiler-error-context-file-name context)
+;;                           (sb-c::compiler-error-context-context context)))
+;;                 (format t "  ~A~%" data))))
+
+
+(defparameter *prepack* 10)
+(defparameter *negative-stack* T)
 (defun pack-new (component)
   (unwind-protect
        ;; (print (list "pack-new" (component-name component)))
@@ -1890,6 +1906,7 @@
 (defun color-vertex (vertex color)
   (setf (vertex-color vertex) color))
 
+                 (event pack-done nil (delay vertices))
 (defun sort-according-to-degree (vertices)
   (sort (copy-list vertices)
         (lambda (a b) (< (vertex-degree a) (vertex-degree b)))))

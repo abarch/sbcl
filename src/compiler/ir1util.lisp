@@ -2220,8 +2220,8 @@ is :ANY, the function name is not checked."
 ;;;; miscellaneous
 
 ;;; Called by the expansion of the EVENT macro.
-(declaim (ftype (sfunction (event-info (or node null)) *) %event))
-(defun %event (info node)
+(declaim (ftype (sfunction (event-info (or node null) &optional t) *) %event))
+(defun %event (info node &optional data)
   (incf (event-info-count info))
   (when (and (>= (event-info-level info) *event-note-threshold*)
              (policy (or node *lexenv*)
@@ -2230,7 +2230,9 @@ is :ANY, the function name is not checked."
       (compiler-notify (event-info-description info))))
 
   (let ((action (event-info-action info)))
-    (when action (funcall action node))))
+    (when action (funcall action node (when data
+                                        (force data))))))
+
 
 ;;;
 (defun make-cast (value type policy)
