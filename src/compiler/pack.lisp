@@ -778,7 +778,7 @@
 ;;; stack in units of the number of references. We count all
 ;;; references as +1, and subtract out REGISTER-SAVE-PENALTY for each
 ;;; place where we would have to save a register.
-;;; write references are prioritized with +2
+(defparameter *write-cost* 2)
 (defun assign-tn-costs (component)
   (do-ir2-blocks (block component)
     (do ((vop (ir2-block-start-vop block) (vop-next vop)))
@@ -797,7 +797,7 @@
         (incf cost))
       (do ((ref (tn-writes tn) (tn-ref-next ref)))
           ((null ref))
-        (incf cost 2))
+        (incf cost *write-cost*))
       (setf (tn-cost tn) cost))))
 
 ;;; Iterate over the normal TNs, storing the depth of the deepest loop
@@ -832,6 +832,38 @@
                          (if loop
                              (loop-depth loop)
                              0))))))))))
+
+(defun assign-tn-depths-sum (component)
+  (when *loop-analyze*
+    (do-ir2-blocks (block component)
+      (do ((vop (ir2-block-start-vop block)
+                (vop-next vop)))
+          ((null vop))
+        (flet ((find-all-tns (head-fun)
+                 (collect ((tns))
+                   (do ((ref (funcall head-fun vop) (tn-ref-across ref)))
+                       ((null ref))
+                     (tns (tn-ref-tn ref)))
+                   (tns))))
+          (dolist (tn (nconc (find-all-tns #'vop-args)
+                             (find-all-tns #'vop-results)
+                             (find-all-tns #'vop-temps)
+                             ;; What does "references in this VOP
+                             ;; mean"? Probably something that isn't
+                             ;; useful in this context, since these
+                             ;; TN-REFs are linked with TN-REF-NEXT
+                             ;; instead of TN-REF-ACROSS. --JES
+                             ;; 2004-09-11
+                             ;; (find-all-tns #'vop-refs)
+                             ))
+            (setf (tn-loop-depth tn)
+                  (+ (tn-loop-depth tn)
+                       (let* ((ir1-block (ir2-block-block (vop-block vop)))
+                              (loop (block-loop ir1-block)))
+                         (if loop
+                             (loop-depth loop)
+                             0))))))))))
+
 
 
 ;;;; load TN packing
@@ -1279,17 +1311,31 @@
         loc
         nil)))
 
-;;; Scan along the target path from TN, looking at readers or writers.
-;;; When we find a packed TN, return CHECK-OK-TARGET of that TN. If
-;;; there is no target, or if the TN has multiple readers (writers),
-;;; then we return NIL. We also always return NIL after 10 iterations
-;;; to get around potential circularity problems.
-;;;
-;;; FIXME: (30 minutes of reverse engineering?) It'd be nice to
-;;; rewrite the header comment here to explain the interface and its
-;;; motivation, and move remarks about implementation details (like
-;;; 10!) inside.
-(defun find-ok-target-offset (tn sc)
+
+
+
+(defun check-ok-target-vertex (target  sc &optional (tn-offset #'tn-offset))
+  (declare (type tn target) (type sc sc) (inline member))
+  (let* ((loc (funcall tn-offset target))
+         (target-sc (tn-sc target))
+         (target-sb (sc-sb target-sc)))
+    (declare (type index loc))
+    ;; We can honor a preference if:
+    ;; -- TARGET's location is in SC's locations.
+    ;; -- The element sizes of the two SCs are the same.
+    ;; -- TN doesn't conflict with target's location.
+    (if (and (eq target-sb (sc-sb sc))
+             (or (eq (sb-kind target-sb) :unbounded)
+                 (member loc (sc-locations sc)))
+             (= (sc-element-size target-sc) (sc-element-size sc))
+             ;;(not (conflicts-in-sc tn sc loc))
+             ;; (zerop (mod loc (sc-alignment sc)))
+             )
+        loc
+        nil)))
+
+
+ (defun find-ok-target-offset (tn sc)
   (declare (type tn tn) (type sc sc))
   (flet ((frob-slot (slot-fun)
            (declare (type function slot-fun))
@@ -1311,6 +1357,59 @@
     (declare (inline frob-slot)) ; until DYNAMIC-EXTENT works
     (or (frob-slot #'tn-reads)
         (frob-slot #'tn-writes))))
+
+;;; Scan along the target path from TN, looking at readers or writers.
+;;; When we find a packed TN, return CHECK-OK-TARGET of that TN. If
+;;; there is no target, or if the TN has multiple readers (writers),
+;;; then we return NIL. We also always return NIL after 10 iterations
+;;; to get around potential circularity problems.
+;;;
+;;; FIXME: (30 minutes of reverse engineering?) It'd be nice to
+;;; rewrite the header comment here to explain the interface and its
+;;; motivation, and move remarks about implementation details (like
+;;; 10!) inside.
+(defun find-ok-target-offset-vertex (tn sc &optional (tn-offset #'tn-offset))
+  (declare (type tn tn) (type sc sc) (type function tn-offset))
+
+  (flet ((frob-slot (slot-fun)
+           (declare (type function slot-fun))
+           (collect ((locs))
+             (let ((count 10)
+                   (current tn))
+               (declare (type index count))
+               (loop
+                  (let ((refs (funcall slot-fun current)))
+                    (unless (and (plusp count)
+                                 refs
+                                 (not (tn-ref-next refs)))
+                      (return nil))
+                    (let ((target (tn-ref-target refs)))
+                      (unless target (return nil))
+                      (setq current (tn-ref-tn target))
+                      (let ((offset (funcall tn-offset current)))
+                        (when offset
+                          (locs (check-ok-target-vertex current  sc tn-offset))))
+                      (decf count)))))
+             (locs))))
+    (declare (inline frob-slot)) ; until DYNAMIC-EXTENT works
+    (let ((r (frob-slot #'tn-reads))
+          (w (frob-slot #'tn-writes)))
+      (remove-duplicates (append r w)))))
+
+
+;; FIXME: assert ueberpruefen
+
+;; so in etwa
+(defun make-tn-offset-mapping (graph)
+  (let ((table (make-hash-table)))
+    (dolist (vertex (interference-vertices graph))
+      (setf (gethash (vertex-tn vertex) table) vertex))
+    (flet ((lookup (tn)
+             (let ((vertex (gethash tn table)))
+               (when vertex
+                 (values (car (vertex-color vertex))
+                         vertex)))))
+      #'lookup)))
 
 ;;;; location selection
 
@@ -1556,10 +1655,10 @@
 
 (defparameter *count-all* 0)
 (defparameter *total-all* 0)
-(defparameter *spill-cost-all* 0) 
+(defparameter *spill-cost-all* 0)
 
 
-;; method :new or :old 
+;; method :new or :old
 (defparameter *reg-alloc-method* :new)
 (defparameter *output* "/homes/abarch/google/sbcl/stats/file.txt")
 
@@ -1570,22 +1669,20 @@
   (setf *spill-cost* 0)
 
 
-  (setf *count-all* 0) 
+  (setf *count-all* 0)
   (setf *total-all* 0)
   (setf *spill-cost-all* 0)
-
-
 
 
   (if (equal *reg-alloc-method* :new)
       (pack-new component)
       (pack-old component))
   (let* ((result-regs
-	  (format nil "~D ~D ~D ~D "  *count* *total* *spill-cost* (if (= *total* 0) 0 (float (/ *count* *total*)))))
-	 (result-all
-	  (format nil "~D ~D ~D ~D "  *count-all* *total-all* *spill-cost-all* (if (= *total-all* 0) 0 (float (/ *count-all* *total-all*)))))
-	 (result (concatenate 'string  result-regs " " result-all))
-	 
+          (format nil "~D ~D ~D ~D "  *count* *total* *spill-cost* (if (= *total* 0) 0 (float (/ *count* *total*)))))
+         (result-all
+          (format nil "~D ~D ~D ~D "  *count-all* *total-all* *spill-cost-all* (if (= *total-all* 0) 0 (float (/ *count-all* *total-all*)))))
+         (result (concatenate 'string  result-regs " " result-all))
+
         (out (open *output* :direction :output :if-does-not-exist :create :if-exists :append)))
     (write-line  result out)
     (close out)))
@@ -1676,7 +1773,7 @@
            ;; always be packed on the stack.
            (when *pack-assign-costs*
              (assign-tn-costs component)
-             (assign-tn-depths component))
+             (assign-tn-depths-sum component))
 
            ;; Allocate normal TNs, starting with the TNs that are used
            ;; in deep loops.
@@ -1695,13 +1792,33 @@
                      ;; well revert to the old behaviour of just
                      ;; packing TNs linearly as they appear.
                      (unless *loop-analyze*
-                       ;;(pack-tn tn nil optimize)
 
-                       (if  (neq (sb-kind (sc-sb (tn-sc tn))) :unbounded)
-                            (let ((vertex (make-vertex tn :normal)))
-                              (unless (member vertex (vertices)) ;;  (tn-offset tn)
-                                (vertices vertex)))
-                            (pack-tn tn t optimize))))))))
+                  ;;      (if  (neq (sb-kind (sc-sb (tn-sc tn))) :unbounded)
+                  ;; (let ((vertex (make-vertex tn :normal))) ;; fixme
+                  ;;   (unless (member vertex (vertices))
+                  ;;     (vertices vertex)))
+                  ;; (pack-tn tn t optimize))
+
+                       ;; sb unbounded then pack on the stack
+                       (cond  ((equal (sb-kind (sc-sb (tn-sc tn))) :unbounded)
+                               (pack-tn tn nil optimize))
+                              ;; sb is register and costs smaller zero, then pack in an alternate on the stack
+                              ((and (equal (sb-kind (sc-sb (tn-sc tn))) :finite)
+                                    (< (tn-cost tn) 0))
+                               (let*  ((fsc (tn-sc tn))
+                                       (alternates (sc-alternate-scs fsc)))
+                                 (dolist (a alternates)
+                                   (when (equal (sb-kind (sc-sb a)) :unbounded)
+                                     (setf (tn-sc tn) a)
+                                     (assert (equal (sb-kind (sc-sb (tn-sc tn))) :unbounded))
+                                     (pack-tn tn nil optimize)
+                                     (return) ))))
+                              ((and (not (equal (sb-kind (sc-sb (tn-sc tn))) :unbounded))
+                                    (>= (tn-cost tn) 0))
+                               (let ((vertex (make-vertex tn :normal)))
+                                 (unless (member vertex (vertices)) ;;  (tn-offset tn)
+                                   (vertices vertex))))
+                              (t (print "STRANGE BEHAVIOUR")))))))))
            #+no(dolist (tn (stable-sort (tns)
                                         (lambda (a b)
                                           (cond
@@ -1741,20 +1858,55 @@
                ((null tn))
              ;;           (unless (tn-offset tn)
              ;;(print tn)
-             (if  (neq (sb-kind (sc-sb (tn-sc tn))) :unbounded)
-                  (let ((vertex (make-vertex tn :normal))) ;; fixme
-                    (unless (member vertex (vertices))
-                      (vertices vertex)))
-                  (pack-tn tn t optimize)))
+
+             (cond  ((equal (sb-kind (sc-sb (tn-sc tn))) :unbounded)
+                               (pack-tn tn nil optimize))
+                              ;; sb is register and costs smaller zero, then pack in an alternate on the stack
+                              ((and (equal (sb-kind (sc-sb (tn-sc tn))) :finite)
+                                    (< (tn-cost tn ) 0))
+                               (let*  ((fsc (tn-sc tn))
+                                       (alternates (sc-alternate-scs fsc)))
+                                 (dolist (a alternates)
+                                   (when (equal (sb-kind (sc-sb a)) :unbounded)
+                                     (setf (tn-sc tn) a)
+                                     (assert (equal (sb-kind (sc-sb (tn-sc tn))) :unbounded))
+                                     (pack-tn tn nil optimize)
+                                     (return) ))))
+                              ((and (not (equal (sb-kind (sc-sb (tn-sc tn))) :unbounded))
+                                    (>= (tn-cost tn ) 0))
+                               (let ((vertex (make-vertex tn :normal)))
+                                 (unless (member vertex (vertices)) ;;  (tn-offset tn)
+                                   (vertices vertex))))
+                              (t (print "STRANGE BEHAVIOUR"))))
+             ;; (if  (neq (sb-kind (sc-sb (tn-sc tn))) :unbounded)
+             ;;      (let ((vertex (make-vertex tn :normal))) ;; fixme
+             ;;        (unless (member vertex (vertices))
+             ;;          (vertices vertex)))
+             ;;      (pack-tn tn t optimize)))
 
            (block nil
              (handler-bind
-                 ((error (lambda ()
-                           ;;(princ (list  "error" var ))
-                                        ;(sb-debug:print-backtrace)
+                 ((error (lambda (condition)
+                           (princ (list  "error" condition))
+                           ;;(sb-debug:print-backtrace)
                            (return-from nil))))
+
+               ;; (labels ((pack-high-spill-cost (vertices)
+               ;;                 (let ((sorted (stable-sort (copy-list (mapcar #'vertex-tn  vertices))
+               ;;                               (lambda (a b)
+               ;;                                 (>= (spill-cost a 10) (spill-cost b 10)) ))))
+               ;;                   (dolist (vertex (subseq sorted 0 (min (length sorted) *prepack*)))
+               ;;                     (pack-tn (vertex-tn vertex) nil optimize)
+               ;;                     (setf (vertex-color vertex)
+               ;;                           (cons (tn-offset (vertex-tn vertex)) (tn-sc (vertex-tn vertex))))
+               ;;                     )
+               ;;                   )
+               ;;                 vertices ))
+
                (let* ((vertices-temp (vertices))
+                     ;; (partially-packed (pack-high-spill-cost vertices-temp))
                       (vertices (pack-colored (iterate-color vertices-temp))))
+                 (event pack-done nil (delay vertices))
                  (dolist (vertex vertices)
                    (let ((tn (vertex-tn vertex)))
                     (unless (tn-offset tn)
@@ -1764,6 +1916,8 @@
                           (incf *count*)
                           (incf *spill-cost* (spill-cost tn) )
                           ))))))))
+
+;;)
          ;;(print "-------finished packing with pack-tn" )
          ;; Do load TN packing and emit saves.
          (let ((*repack-blocks* nil))
@@ -1788,11 +1942,11 @@
 
 
 
-(progn
 
 
-(defun spill-cost (tn)
-  (* (1+ (tn-loop-depth tn)) (tn-cost tn)))
+(defparameter *loop-depth-weight* 1)
+(defun spill-cost (tn &optional (loop-weight *loop-depth-weight*))
+  (* (+ (max  loop-weight 1) (tn-loop-depth tn)) (tn-cost tn)))
 
 (defun tn-allocation (tn)
   (incf *total-all*)
@@ -1809,6 +1963,8 @@
     (vertices nil :type list))
 
 
+
+
 ;; all TNS types are included in the graph, both with offset and without
 (defun construct-interference (vertices)
   (let  ((interference (make-interference vertices)))
@@ -1816,23 +1972,25 @@
       (let* ((tn (vertex-tn vertex))
              (offset (tn-offset tn))
              (sc (tn-sc tn)))
-        (if offset
-          (setf  (vertex-color vertex) (cons  offset sc))
-          (setf (vertex-color vertex) nil)
- )))
+        (setf (vertex-incidence vertex) '()
+              (vertex-invisible vertex) nil
+              (vertex-color vertex)
+              (when offset
+                (cons  offset sc)))))
     (setf (interference-vertices interference) vertices)
-     (loop for (a . rest) on vertices
-        do (loop for b in rest
-              do
-
-                (let ((conflict (tns-conflict (vertex-tn a) (vertex-tn b))))
-                  (when conflict
-
-                  (push  a (vertex-incidence b))
-                  (push b (vertex-incidence a))
-                  ;; (print (list "vertex" a " and vertex " b ))
-                  ))))
-     interference))
+    (loop for (a . rest) on vertices
+       do (loop for b in rest
+             do (let ((conflict (tns-conflict (vertex-tn a) (vertex-tn b)))
+                      (same-sb (equal (sc-sb (tn-sc (vertex-tn a)))
+                                      (sc-sb (tn-sc (vertex-tn b))))))
+                  (when (and conflict same-sb)
+                    (assert (not (member a (vertex-incidence b))))
+                    (assert (not (member b (vertex-incidence a))))
+                    (push a (vertex-incidence b))
+                    (push b (vertex-incidence a))
+                    ;; (print (list "vertex" a " and vertex " b ))
+                    ))))
+    interference))
 
 
  ;; vertex in an interference graph
@@ -1854,7 +2012,7 @@
 
 
 
-     ;; PROPERTIES
+     ;; PROPE(RTIES
      ;; color = (cons offset sc)
      (color nil :type (or cons null))
     ;; (squeeze nil :type (or index null))
@@ -1906,7 +2064,6 @@
 (defun color-vertex (vertex color)
   (setf (vertex-color vertex) color))
 
-                 (event pack-done nil (delay vertices))
 (defun sort-according-to-degree (vertices)
   (sort (copy-list vertices)
         (lambda (a b) (< (vertex-degree a) (vertex-degree b)))))
@@ -1942,34 +2099,184 @@
 (defun filter-normal (vertices)
   (remove-if-not (lambda (a) (equal (vertex-pack-type a) :normal)) vertices))
 
+;; Return non-nil if COLOR conflicts with any of NEIGHBOR-COLORS.
+;; Take into account element sizes of the respective SCs.
+(defun color-conflict-p (color neighbor-colors)
+  (declare (type (cons integer sc) color))
+  (destructuring-bind (offset . sc) color
+    (let ((element-size (sc-element-size sc)))
+      (dolist (neighbor-color neighbor-colors)
+        (declare (type (cons integer sc) color))
+        (destructuring-bind (neighbor-offset . neighbor-sc) neighbor-color
+          (let ((neighbor-element-size (sc-element-size neighbor-sc)))
+            (dotimes (i element-size)
+              (when (<= neighbor-offset
+                        (+ offset i)
+                        (+ neighbor-offset neighbor-element-size -1))
+                (return-from color-conflict-p t)))))))))
+
+(defun neighbor-colors (vertex)
+  (mapcar #'vertex-color (filter-visible (vertex-incidence vertex))))
+
+;; Assumes that VERTEX with pack-type :WIRED.
+(defun color-possible-p (color vertex)
+  (declare (type integer color) (type vertex vertex))
+  (and (or (and (neq (vertex-pack-type vertex) :wired)
+                (not (tn-offset (vertex-tn vertex))))
+           (= color (car (vertex-color vertex))))
+       (not (color-conflict-p (cons color (vertex-sc vertex))
+                              (neighbor-colors vertex)))))
+
+;; TODO reserved?
+(defun possible-colors (vertex
+                        &optional (colors (sc-locations (vertex-sc vertex))))
+  (declare (type vertex vertex))
+  (remove-if (lambda (color)
+               (not (color-possible-p color vertex)))
+             (stable-sort (copy-list colors) #'> ;; TODO separate function?
+               :key (lambda (color)
+                      (loop for offset from color
+                         repeat (sc-element-size (vertex-sc vertex))
+                         maximize (svref
+                                   (finite-sb-always-live-count (sc-sb (vertex-sc vertex)))
+                                   offset))))))
+
+(defun target-vertices (vertex tn-offset)
+  (flet ((frob-slot (slot-fun)
+           (declare (type function slot-fun))
+           (collect ((vertices))
+             (let ((count 20)
+                   (current (vertex-tn vertex)))
+               (declare (type index count))
+               (loop
+                  (let ((refs (funcall slot-fun current)))
+                    (unless (and (plusp count)
+                                 refs
+                                 (not (tn-ref-next refs)))
+                      (return nil))
+                    (let ((target (tn-ref-target refs)))
+                      (unless target (return nil))
+                      (setq current (tn-ref-tn target))
+                      (multiple-value-bind (offset vertex1) (funcall tn-offset current)
+                        (when (and offset (not (member vertex1 (vertex-incidence vertex))))
+                          ;; TODO should be assert?
+                          (when (eq (sc-sb (vertex-sc vertex))
+                                    (sc-sb (tn-sc current)))
+                            (vertices vertex1))))
+                      (decf count)))))
+             (vertices))))
+    (declare (inline frob-slot)) ; until DYNAMIC-EXTENT works
+    (let ((r (frob-slot #'tn-reads))
+          (w (frob-slot #'tn-writes)))
+      (remove-duplicates (append r w)))))
+
+(defun color-for-vertices (vertices
+                           &optional
+                           (colors (remove-duplicates
+                                    (mapcan #'possible-colors vertices))))
+  (let ((best-color      nil)
+        (best-compatible '())
+        (best-cost       nil))
+    #+no (print :start)
+    (dolist (color colors)
+      (let ((compatible '())
+            (cost 0))
+        (dolist (vertex vertices)
+          (when (and (notany (lambda (existing)
+                               (member vertex (vertex-incidence existing)))
+                             compatible)
+                     (color-possible-p color vertex))
+            (incf cost (max 1 (spill-cost (vertex-tn vertex))))
+            (push vertex compatible)))
+        #+no (print (list :compatible color cost (length compatible)))
+        (when #+no (or (null best-compatible)
+                  (> (length compatible)
+                     (length best-compatible)))
+              (or (null best-cost)
+                  (> cost best-cost))
+          (setf best-color      color
+                best-compatible compatible
+                best-cost       cost))))
+    #+no (print (list :result best-color best-cost))
+    (values best-color best-compatible)))
+
 ;; assuming that each neighbor of the vertex has the same sb
-(defun generate-color (vertex)
-  (let* ((incidence (vertex-incidence vertex))
-         (visibles (filter-visible incidence))
+(defun generate-color (vertex lookup)
+  (let* (#+no (incidence (vertex-incidence vertex))
+         #+no (visibles (filter-visible incidence))
          (sc (vertex-sc vertex))
-         (all-locations (sc-locations sc))
+         #+no (all-locations (sc-locations sc))
          (reserved (sc-reserve-locations sc))
          ;; FIXME; is it necessary?
-         (locations all-locations) ;; (remove-if (lambda (x) (member x reserved)) all-locations))
-         (element-size (sc-element-size sc)))
-    ;; iterateover SB locations with SC index
+         #+no (locations all-locations) ;; (remove-if (lambda (x) (member x reserved)) all-locations))
+         ;(element-size (sc-element-size sc))
+         #+no (colors (mapcar  (lambda (c)  (vertex-color c)) visibles))
+         ;(conflict-offsets (mapcar #'car colors))
+         #+no (ref-locs (remove nil (find-ok-target-offset-vertex (vertex-tn vertex) sc lookup))))
+
+    ;; iterate over SB locations with SC index
     (assert (= (length reserved) 0))
-   ;; (print (list "visible" (length visibles) "total" (length incidence) (vertex-tn vertex) ))
-    (dolist (loc locations)
-      ;;iterate over colored incidence elements
-      (block try-loc
-        (dolist (color   (mapcar  (lambda (c)  (vertex-color c)) visibles))
-          (assert color)
-          (destructuring-bind (offset-neighbor . sc-neighbor)  color
-            (let ((element-size-neighbor (sc-element-size sc-neighbor)))
-              (dotimes (el element-size)
-                (when
-                    (<= offset-neighbor
-                        (+ loc el)
-                        (+ offset-neighbor element-size-neighbor -1))
-                  (return-from try-loc))))))
+
+    ;; (print (list "visible" (length visibles) "total" (length incidence) (vertex-tn vertex) ))
+    ;; (print (list "ref-locs " ref-locs))
+
+    #+no (print (list :colors-for-me (possible-colors vertex)))
+    (let ((colors (possible-colors vertex)))
+      #+no (unless colors
+        (let ((*print-level* 3))
+          (print (list :no-colors-for-me vertex)))
+        (print (list :neighbors
+                     (sort (remove-duplicates (mapcar #'car (neighbor-colors vertex))) #'<)))
+        (print (list :sc (sc-locations (vertex-sc vertex)))))
+      (when colors
+        (let ((targets (target-vertices vertex lookup)))
+          (multiple-value-bind (color recolor-vertices)
+              (if targets
+                  (color-for-vertices targets colors)
+                  (first colors))
+            (unless color
+              (let ((*print-level* 3))
+                (print :failed-to-align-with-targets)
+                (dolist (target (target-vertices vertex lookup))
+                  (print (list :target target))
+                  (print (possible-colors target)))
+                (print (list :colors-for-me
+                             vertex
+                             (possible-colors vertex)))
+                #+no (when (not (possible-colors vertex))
+                       (print (vertex-incidence vertex)))))
+            (when color
+              #+no (print (list :color-for-all color))
+              #+no (let ((*print-level* 4))
+                     (print (list :recolor recolor-vertices)))
+              (dolist (target recolor-vertices)
+                (assert (car (vertex-color target)))
+                (unless (eql color (car (vertex-color target)))
+                  (assert (eq (sc-sb (vertex-sc vertex))
+                              (sc-sb (vertex-sc target))))
+                  (assert (not (tn-offset (vertex-tn target))))
+                  (assert (color-possible-p color target))
+                  (setf (car (vertex-color target)) color)))
+              #+no (let ((*print-level* 4))
+                     (print (list :recolored recolor-vertices)))
+              (return-from generate-color (cons color sc)))))))
+
+    #+no (dolist (loc (append ref-locs
+                         (remove-if (lambda (x) (member x ref-locs)) locations)))
+      ;; (print (list "location tried " loc))
+      ;; iterate over colored incidence elements
+      (when (color-possible-p loc vertex)
         ;;(print (list "sc length loc"  sc all-locations loc))
-        (return-from generate-color (cons loc sc))))))
+        (cond
+          ((not ref-locs))
+          ((member loc ref-locs)
+           (print (list "success" loc)))
+          (t
+           (print (list "failed" loc ref-locs))))
+        (return-from generate-color (cons loc sc))))
+
+    #+no (print :no-color)
+    nil))
 
 ;; assign color to the last slot on the stack
 ;; iterate over stack
@@ -1986,14 +2293,39 @@
 (defun color (interference)
   (setf sb!c::*precoloring-stack* '())
   (setf sb!c::*prespilling-stack* '())
-  
-     ;;(let ((sorted-vertex (sort-according-to-degree-cost (interference-vertices interference))))
-      ;; (do ((vertex (first sorted-vertex)  (first sorted-vertex)))
-       ;;    ((null vertex))
-        ;; (setf sorted-vertex (sort-according-to-degree-cost (filter-visible (rest sorted-vertex))))
+
+  (let ((verts (filter-uncolored (interference-vertices interference))))
+    (labels ((remove-one ()
+               (when verts
+               (let* ((value  (reduce #'min ;;  #'max vertices :key #'vertex-degree))
+                                         (mapcar #'vertex-tn verts)
+                                      :key #'spill-cost))
+                      (vertex (dolist (vertex verts)
+                                (when  (= (spill-cost (vertex-tn vertex)) value) (return vertex)))))
+                 (setf verts   (remove vertex verts))
+                  vertex)))
+             ;; (remove-one-briggs ()
+             ;;   (dolist (vertex verts)
+             ;;          (when (< (vertex-degree vertex) (vertex-k vertex))
+             ;;            (setf verts (remove vertex verts))
+             ;;            (return-from remove-one-briggs vertex)))
+             ;;   (when verts
+             ;;          (let ((any-vertex (first verts)))
+             ;;            (setf verts (remove any-vertex verts))
+             ;;            any-vertex)))
+             )
+
+      (do ((vertex (remove-one) (remove-one)))
+          ((null vertex))
 
 
-  (dolist (vertex (interference-vertices interference))
+  ;; (let ((sorted-vertex (sort-according-to-degree (interference-vertices interference))))
+  ;;       (do ((vertex (first sorted-vertex)  (first sorted-vertex)))
+  ;;           ((null vertex))
+  ;;         (setf sorted-vertex (sort-according-to-degree (filter-visible (rest sorted-vertex))))
+
+
+ ;; (dolist (vertex (interference-vertices interference))
        (unless (vertex-color vertex)
 ;       (print (vertex-tn vertex))
         (let ((k (vertex-k vertex)))
@@ -2005,12 +2337,12 @@
                 (spill-candidate vertex)
                 (push vertex sb!c::*prespilling-stack*))))
         ;;(print (list "processed vertex" vertex (vertex-degree vertex)))
-          ))
+          ))))
 
+  (let ((lookup (make-tn-offset-mapping interference)))
 
-;;  (collect ((defect))
   (dolist (vertex  sb!c::*precoloring-stack*)
-    (let ((color (generate-color vertex)))
+    (let ((color (generate-color vertex lookup)))
       ;;(print (list "color + tn"  (vertex-tn vertex) color))
       (if color
         (assign-color color vertex)
@@ -2023,45 +2355,121 @@
 
 
 
+
   (do ((vertex  (pop sb!c::*prespilling-stack*)  (pop sb!c::*prespilling-stack*)))
         ((null vertex))
-      (let ((color (generate-color vertex)))
+      (let ((color (generate-color vertex lookup)))
         ;;(print (list "color + tn" (vertex-tn vertex) color))
         (when color
-          (assign-color color vertex))))
+          (assign-color color vertex)))))
 
   interference)
 
-;; fixme: add a global var for the number of iterations
-(defun iterate-color (vertices &optional (number-iterations 1000000))
-  (let ((spill-list '())
-        (rest-vertices vertices))
+(defparameter *iterations* 500)
 
+(defun spill-cost< (a b)
+  (cond
+    ((< (tn-loop-depth (vertex-tn a))
+        (tn-loop-depth (vertex-tn b)))
+     t)
+    ((= (tn-loop-depth (vertex-tn a))
+        (tn-loop-depth (vertex-tn b)))
+     (< (tn-cost (vertex-tn a))
+        (tn-cost (vertex-tn b))))
+    (t nil)))
+
+;; Return all :NORMAL neighbors which have a unique color, i.e. ignore
+;; neighbors for which some other neighbor has the same color.
+(defun collect-spill-candidates (vertex)
+  (let ((colors '()))
+    (dolist (neighbor (filter-normal (vertex-incidence vertex)))
+      (let* ((color (car (vertex-color neighbor)))
+             (cell (assoc color colors)))
+        (if cell
+            (setf (cdr cell) nil)
+            (push (cons color neighbor) colors))))
+    (remove nil (mapcar #'cdr colors))))
+
+(defun collect-min-spill-candidates (vertex)
+  (let ((colors '()))
+    (dolist (neighbor (filter-normal (vertex-incidence vertex)))
+      (let* ((color (car (vertex-color neighbor)))
+             (cell (assoc color colors))
+             (spillcost-neighbor  (spill-cost (vertex-tn neighbor)))
+             (spillcost-cell (when cell (spill-cost (vertex-tn (cdr cell))))))
+        (cond  ((and cell (< spillcost-neighbor spillcost-cell))
+                (setf colors (remove cell colors))
+                (push (cons color neighbor) colors))
+               ((and cell (>= spillcost-neighbor spillcost-cell)) t)
+               (t (push (cons color neighbor) colors)))))))
+
+
+(defparameter *candidate-color-flag* t)
+;; fixme: add a global var for the number of iterations
+(defun iterate-color (vertices &optional (iterations *iterations*))
+  (let ((spill-list '())
+        (number-iterations (min iterations (length vertices)))
+        (rest-vertices vertices))
+    ;(print number-iterations)
   (labels ((iter (vert)
              ;;(print "iterating")
-             (let* ((interference (construct-interference vert))
+             (let* ((interference (construct-interference
+                                  #+no  vert
+                                       (stable-sort
+                                          (copy-list  vert)
+                                          (lambda (a b)
+                                            (cond
+                                              ((> (tn-loop-depth (vertex-tn a))
+                                                  (tn-loop-depth (vertex-tn b)))
+                                               t)
+                                              ((= (tn-loop-depth (vertex-tn a))
+                                                  (tn-loop-depth (vertex-tn b)))
+                                               (> (tn-cost (vertex-tn a))
+                                                  (tn-cost (vertex-tn b))))
+                                              (t nil))))))
                     ;; (number-of-colored-before (length (filter-colored (interference-vertices interference))))
                     (colored (color interference))
-                    (spill-candidates  (filter-normal (filter-uncolored (interference-vertices colored))))
+                    (spill-candidates  (filter-uncolored (filter-normal  (interference-vertices colored)))) ;; filter -uncolored
                     ;; (number-of-colored (length (filter-colored (interference-vertices colored))))
 
 )
 
                ;;(print (list "spill candidate" spill-candidates))
                (when spill-candidates
-                 (let* ((sorted-vertices (stable-sort
-                                         (copy-list  spill-candidates)
-                                                   (lambda (a b)
-                                                     (cond
-                                                       ((< (tn-loop-depth (vertex-tn a))
-                                                           (tn-loop-depth (vertex-tn b)))
-                                                        t)
-                                                       ((= (tn-loop-depth (vertex-tn a))
-                                                           (tn-loop-depth (vertex-tn b)))
-                                                        (< (tn-cost (vertex-tn a)) (tn-cost (vertex-tn b))))
-                                                       (t nil)))))
+                 (let* ((offenders (remove-duplicates
+                                    (mapcan (lambda (candidate)
+                                              (list*
+                                               candidate
+                                               ;;(sort (copy-list
+                                               (if *candidate-color-flag*
+                                                   (collect-min-spill-candidates candidate)
+                                                   (filter-normal (vertex-incidence candidate)))))
+                                                    ;; #'> :key #'vertex-degree))
+                                               #+no (let ((neighbors
+                                                      (sort (copy-list
+                                                             (filter-normal
+                                                              (vertex-incidence candidate)))
+                                                            #'> :key #'vertex-degree)))
+                                                 (subseq neighbors 0 (min (length neighbors) 4)))
+                                            spill-candidates)))
+                        (sorted-vertices (stable-sort
+                                          offenders
+                                          #+no (copy-list spill-candidates)
+                                          (lambda (a b)
+                                            #+no (cond
+                                              ((< (tn-loop-depth (vertex-tn a))
+                                                  (tn-loop-depth (vertex-tn b)))
+                                               t)
+                                              ((= (tn-loop-depth (vertex-tn a))
+                                                  (tn-loop-depth (vertex-tn b)))
+                                               (< (tn-cost (vertex-tn a))
+                                                  (tn-cost (vertex-tn b))))
+                                              (t nil))
+                                            (< (spill-cost (vertex-tn a)) (spill-cost (vertex-tn b)))
+                                            )))
                         (lowest-cost-spill (first sorted-vertices)))
 
+                   (setf (vertex-color lowest-cost-spill) nil)
 
                    (push lowest-cost-spill spill-list)
                    (setf rest-vertices  (remove lowest-cost-spill (interference-vertices colored)))
@@ -2077,7 +2485,7 @@
     (do  ((colored  (iter rest-vertices) (iter rest-vertices)))
          ((or  (= number-iterations 0)  (null (filter-normal (filter-uncolored rest-vertices)))))
       (decf number-iterations)
-      ;;(print number-iterations)
+      (print number-iterations)
       ;; (print colored)
       ;; (print (list (length spill-list) (length (filter-uncolored rest-vertices)) (length rest-vertices)))
       ))
@@ -2114,10 +2522,7 @@
 
           (pack-wired-tn (vertex-tn vertex) nil))))
               ;; no color generated and the tn is not packed
-     colored-vertices))
-
-
-
+     colored-vertices)
 
 
 (defun pack-old (component)
